@@ -2,7 +2,7 @@ script_name("Auto Kode AFK")
 script_author("xZiyy")
 script_version("3.1")
 script_description("Otomatis membalas kode AFK 1 kali instan tanpa spam.")
-
+if not _G.AUTH_AFK_LULUS then return end
 require "lib.moonloader"
 
 local imgui = require "mimgui"
