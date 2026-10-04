@@ -1,0 +1,305 @@
+script_name("Auto Kode AFK")
+script_author("xZiyy")
+script_version("3.1")
+script_description("Otomatis membalas kode AFK 1 kali instan tanpa spam.")
+
+require "lib.moonloader"
+
+local imgui = require "mimgui"
+local json  = require "cjson"
+
+local okFfi, ffi = pcall(require, "ffi")
+
+local okEnc, encoding = pcall(require, "encoding")
+if okEnc then
+    encoding.default = 'CP1252'
+    u8 = encoding.UTF8
+else
+    u8 = function(s) return s end
+end
+
+local Col = {
+    Text = 0, TextDisabled = 1, WindowBg = 2, ChildBg = 3, PopupBg = 4, Border = 5,
+    FrameBg = 7, FrameBgHovered = 8, FrameBgActive = 9, TitleBg = 10,
+    TitleBgActive = 11, TitleBgCollapsed = 12, ScrollbarBg = 14, ScrollbarGrab = 15,
+    CheckMark = 18, SliderGrab = 19, Button = 21, ButtonHovered = 22,
+    ButtonActive = 23, Separator = 27,
+}
+
+local CFG_PATH = getWorkingDirectory() .. "/config/autokode_afk.json"
+
+local defaultCfg = {
+    autoCode  = true,
+    chatlog   = true,
+}
+
+local function jsonSave(path, data)
+    local ok, str = pcall(json.encode, data)
+    if not ok then return false end
+    local f = io.open(path, "w+")
+    if not f then return false end
+    f:write(str); f:close()
+    return true
+end
+
+local function jsonLoad(path, default)
+    if not doesFileExist(path) then return default end
+    local f = io.open(path, "r")
+    if not f then return default end
+    local content = f:read("*a"); f:close()
+    local ok, data = pcall(json.decode, content)
+    if ok and type(data) == "table" then return data end
+    return default
+end
+
+if not doesDirectoryExist(getWorkingDirectory() .. "/config") then
+    pcall(createDirectory, getWorkingDirectory() .. "/config")
+end
+
+local cfg = jsonLoad(CFG_PATH, defaultCfg)
+for k, v in pairs(defaultCfg) do
+    if cfg[k] == nil then cfg[k] = v end
+end
+
+local cfgDirty    = false
+local lastCfgSave = 0
+
+local function saveCfg() jsonSave(CFG_PATH, cfg) end
+
+local function flushCfg()
+    if not cfgDirty then return end
+    local t = getGameTimer()
+    if t - lastCfgSave < 1500 then return end
+    cfgDirty    = false
+    lastCfgSave = t
+    saveCfg()
+end
+
+local function markDirty() cfgDirty = true end
+
+local ST = {
+    code         = nil,
+    logs         = {},
+    lastCodeSent = nil, -- Sistem pelacakan: Mengingat kode yang sudah dikirim
+}
+
+local function addLog(msg)
+    ST.logs[#ST.logs + 1] = os.date("%H:%M:%S") .. "  " .. msg
+    while #ST.logs > 8 do table.remove(ST.logs, 1) end
+end
+
+local function now() return getGameTimer() end
+
+local function say(msg)
+    if cfg.chatlog then sampAddChatMessage("{00FF99}[AutoAFK] " .. msg, -1) end
+    addLog(msg)
+end
+
+-- AUTO KIRIM KODE AFK -----------------------------------------------------
+local function validasi(s)
+    if not s or #s == 0 or #s > 900 then return nil end
+    local ok = 0
+    for i = 1, #s do
+        local c = s:byte(i)
+        if c == 9 or c == 10 or c == 13 or (c >= 32 and c < 127) then ok = ok + 1 end
+    end
+    if (ok / #s) < 0.85 then return nil end
+    return s
+end
+
+local function bacaTeks(bs)
+    if not okFfi then return nil end
+    if type(raknetBitStreamGetDataPtr) ~= "function" then return nil end
+    local okP, ptr = pcall(raknetBitStreamGetDataPtr, bs)
+    if not okP or not ptr then return nil end
+    local okS, raw = pcall(ffi.string, ffi.cast("const char*", ptr), 1200)
+    if not okS or not raw or #raw < 9 then return nil end
+
+    local len = 0
+    for i = 5, 8 do
+        len = len + raw:byte(i) * (256 ^ (i - 5))
+    end
+    if len > 0 and len <= 900 and #raw >= 8 + len then
+        local s = validasi(raw:sub(9, 8 + len))
+        if s then return s end
+    end
+
+    if #raw >= 5 then
+        local l2 = raw:byte(3) + raw:byte(4) * 256
+        if l2 > 0 and l2 <= 900 and #raw >= 4 + l2 then
+            local s = validasi(raw:sub(5, 4 + l2))
+            if s then return s end
+        end
+    end
+
+    return nil
+end
+
+local function kirimKode(code)
+    -- Jika kode ini persis sama dengan yang baru saja dikirim, BATALKAN (Anti-Spam)
+    if ST.lastCodeSent == code then return end
+    
+    -- Catat kode ini sebagai kode yang sudah dikirim
+    ST.lastCodeSent = code 
+
+    lua_thread.create(function()
+        wait(250) -- Jeda sangat singkat (seperempat detik) hanya agar game tidak crash/freeze
+        sampSendChat("/afk " .. code)
+        say("Berhasil membalas kode " .. code)
+    end)
+end
+
+local function mintaKode()
+    sampSendChat("/afk")
+    say("Mengirim /afk, menunggu balasan server...")
+end
+
+local function keluarAfk()
+    if not ST.code then
+        say("Kode AFK belum didapatkan dari server.")
+        return
+    end
+    sampSendChat("/afk " .. ST.code)
+    ST.code = nil
+    ST.lastCodeSent = nil
+    say("Keluar dari mode AFK.")
+end
+
+if type(addEventHandler) == "function" then
+    addEventHandler("onReceiveRpc", function(id, bs)
+        if not cfg.autoCode then return end
+        local text = bacaTeks(bs)
+        if not text then return end
+        local low = string.lower(text)
+
+        local code = low:match("afk%s+(%d%d%d%d%d%d)")
+        if code then
+            if ST.code ~= code then
+                ST.code = code
+                addLog("Mendapat kode baru: " .. code)
+            end
+            kirimKode(code)
+            return
+        end
+
+        if low:find("keluar dari mode afk", 1, true) then
+            ST.code = nil
+            ST.lastCodeSent = nil -- Reset memori kode jika sudah berhasil keluar AFK
+            addLog("Telah kembali roleplay")
+            return
+        end
+
+        if low:find("sedang afk", 1, true) and ST.code then
+            kirimKode(ST.code)
+        end
+    end)
+end
+
+-- TAMPILAN UI ------------------------------------------------------------
+local showMenu  = imgui.new.bool(false)
+local chkCode   = imgui.new.bool(cfg.autoCode)
+local chkLog    = imgui.new.bool(cfg.chatlog)
+
+local clr = {
+    accent = imgui.ImVec4(0.0, 1.0, 0.6, 1.0),
+    dim    = imgui.ImVec4(0.62, 0.62, 0.62, 1.0),
+    warn   = imgui.ImVec4(1.0, 0.78, 0.2, 1.0),
+    blue   = imgui.ImVec4(0.15, 0.4, 0.62, 1.0),
+    blueH  = imgui.ImVec4(0.2, 0.5, 0.75, 1.0),
+    blueA  = imgui.ImVec4(0.12, 0.32, 0.5, 1.0),
+}
+
+local function pushBtn(c, ch, ca)
+    imgui.PushStyleColor(Col.Button, c)
+    imgui.PushStyleColor(Col.ButtonHovered, ch)
+    imgui.PushStyleColor(Col.ButtonActive, ca)
+end
+
+imgui.OnInitialize(function()
+    local st = imgui.GetStyle()
+    local c  = st.Colors
+    c[Col.WindowBg]         = imgui.ImVec4(0.02, 0.02, 0.02, 0.94)
+    c[Col.ChildBg]          = imgui.ImVec4(0.06, 0.06, 0.06, 1.0)
+    c[Col.FrameBg]          = imgui.ImVec4(0.11, 0.11, 0.11, 1.0)
+    c[Col.FrameBgHovered]   = imgui.ImVec4(0.17, 0.17, 0.17, 1.0)
+    c[Col.FrameBgActive]    = imgui.ImVec4(0.21, 0.21, 0.21, 1.0)
+    c[Col.TitleBg]          = imgui.ImVec4(0.0, 0.0, 0.0, 1.0)
+    c[Col.CheckMark]        = imgui.ImVec4(0.0, 1.0, 0.6, 1.0)
+    c[Col.Button]           = imgui.ImVec4(0.13, 0.13, 0.13, 1.0)
+    c[Col.ButtonHovered]    = imgui.ImVec4(0.0, 1.0, 0.6, 0.22)
+    c[Col.ButtonActive]     = imgui.ImVec4(0.0, 1.0, 0.6, 0.40)
+    c[Col.Separator]        = imgui.ImVec4(0.18, 0.18, 0.18, 1.0)
+    c[Col.TextDisabled]     = imgui.ImVec4(0.5, 0.5, 0.5, 1.0)
+    st.WindowRounding = 10.0
+    st.FrameRounding  = 5.0
+    st.ChildRounding  = 6.0
+    st.WindowPadding  = imgui.ImVec2(14, 14)
+end)
+
+imgui.OnFrame(
+    function() return showMenu[0] end,
+    function()
+        imgui.SetNextWindowSize(imgui.ImVec2(350, 270), imgui.Cond.FirstUseEver)
+        imgui.Begin("Auto AFK", showMenu, imgui.WindowFlags.NoCollapse)
+
+        imgui.TextColored(clr.accent, "AUTO KODE AFK")
+        imgui.SameLine()
+        imgui.TextColored(clr.dim, "| 100% Aman (No Cheat)")
+
+        imgui.Text("Kode Saat Ini:")
+        imgui.SameLine()
+        if ST.code then
+            imgui.TextColored(clr.warn, ST.code)
+        else
+            imgui.TextColored(clr.dim, "Belum ada")
+        end
+
+        imgui.Spacing()
+
+        pushBtn(clr.blue, clr.blueH, clr.blueA)
+        if imgui.Button("Minta Kode Manual", imgui.ImVec2(150, 30)) then
+            mintaKode()
+        end
+        imgui.SameLine()
+        if imgui.Button("Keluar AFK", imgui.ImVec2(0, 30)) then
+            keluarAfk()
+        end
+        imgui.PopStyleColor(3)
+
+        imgui.Spacing()
+
+        if imgui.Checkbox("Auto balas kode", chkCode) then
+            cfg.autoCode = chkCode[0] markDirty()
+        end
+        imgui.SameLine()
+        if imgui.Checkbox("Chatlog info", chkLog) then
+            cfg.chatlog = chkLog[0] markDirty()
+        end
+
+        imgui.Separator()
+        imgui.BeginChild("LOG", imgui.ImVec2(0, 80), true)
+        local from = math.max(1, #ST.logs - 5)
+        for i = from, #ST.logs do
+            imgui.TextColored(clr.dim, ST.logs[i])
+        end
+        imgui.EndChild()
+
+        if imgui.Button("Simpan Pengaturan", imgui.ImVec2(150, 0)) then
+            cfgDirty = false saveCfg()
+        end
+
+        flushCfg()
+        imgui.End()
+    end
+)
+
+function main()
+    while not isSampAvailable() do wait(100) end
+
+    sampRegisterChatCommand("afa", function() showMenu[0] = not showMenu[0] end)
+    sampAddChatMessage("{00FF99}[Auto AFK] Kirim Instan v3.1 | /afa untuk buka menu", -1)
+
+    while true do
+        wait(100)
+    end
+end
